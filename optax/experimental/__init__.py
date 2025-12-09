@@ -17,4 +17,10 @@
 
 from optax.experimental import _aggregating as aggregating
 from optax.experimental import _microbatching as microbatching
+
+AccumulationType = microbatching.AccumulationType
+Accumulator = microbatching.Accumulator
+gvmap = microbatching.gvmap
 microbatch = microbatching.microbatch
+micro_grad = microbatching.micro_grad
+reshape_batch_axis = microbatching.reshape_batch_axis
