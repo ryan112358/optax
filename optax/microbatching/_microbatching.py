@@ -183,8 +183,8 @@ def _sum() -> Accumulator:
 
 def _mean(num_microbatches: int) -> Accumulator:
   """An Accumulator that computes the mean of microbatched outputs."""
-  if num_microbatches <= 0:
-    raise ValueError(f'{num_microbatches=} must be positive.')
+  if num_microbatches < 0:
+    raise ValueError(f'{num_microbatches=} must be non-negative.')
   return _lift(
       Accumulator(
           init=_with_floating_check(jnp.zeros_like),
@@ -230,8 +230,8 @@ def _get_out_sharding(x):
 
 def _concat(num_microbatches: int) -> Accumulator:
   """An Accumulator that concatenates microbatched outputs along the axis 0."""
-  if num_microbatches <= 0:
-    raise ValueError(f'{num_microbatches=} must be positive.')
+  if num_microbatches < 0:
+    raise ValueError(f'{num_microbatches=} must be non-negative.')
 
   def init(value):
     shape = (num_microbatches,) + value.shape
@@ -283,6 +283,43 @@ def _canonicalize(
     raise ValueError(f'Unknown accumulator: {acc}')
 
   return _compose(jax.tree.map(fun, tree))
+
+
+def _eval_shape_fun(
+    fun: Function,
+    microbatch_size: int,
+    argnums: Sequence[int],
+    argnames: Sequence[str],
+    in_axes: Sequence[int],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any]
+) -> Any:
+  """Evaluates the shape of `fun` for a single microbatch."""
+  # We construct a dummy microbatch by dropping the 0th axis of the batch args.
+  # This corresponds to taking a slice [0:microbatch_size] from the unreshaped args.
+  # But we don't actually compute it, we just use jax.eval_shape with dummy arguments.
+
+  def _slice_to_microbatch_size(x, axis):
+    new_shape = x.shape[:axis] + (microbatch_size,) + x.shape[axis + 1:]
+    sharding = getattr(jax.typeof(x), 'sharding', None)
+    if sharding is not None:
+      return jax.ShapeDtypeStruct(new_shape, x.dtype, sharding=sharding)
+    return jax.ShapeDtypeStruct(new_shape, x.dtype)
+
+  dummy_args = list(args)
+  dummy_kwargs = dict(kwargs)
+
+  for i, ax in zip(argnums, in_axes):
+    dummy_args[i] = jax.tree.map(
+        lambda x: _slice_to_microbatch_size(x, ax), args[i]
+    )
+
+  for i, ax in zip(argnames, in_axes[len(argnums) :]):
+    dummy_kwargs[i] = jax.tree.map(
+        lambda x: _slice_to_microbatch_size(x, ax), kwargs[i]
+    )
+
+  return jax.eval_shape(fun, *dummy_args, **dummy_kwargs)
 
 
 def _reshape_all_args(
@@ -417,6 +454,19 @@ def microbatch(
     num_microbatches = batch_size // microbatch_size
     accumulator_ = _canonicalize(accumulator, num_microbatches)
 
+    early_stop = num_real_microbatches is not None
+    loop_bound = num_real_microbatches if early_stop else num_microbatches
+
+    # If loop_bound == 0, we avoid constructing the fori_loop and just return
+    # the finalized initial carry to prevent JAX tracing errors with empty arrays.
+    output_shape = _eval_shape_fun(
+        fun, microbatch_size, argnums, argnames, in_axes, args, kwargs
+    )
+    init_carry = accumulator_.init(output_shape)
+
+    if isinstance(loop_bound, int) and loop_bound == 0:
+      return accumulator_.finalize(init_carry)
+
     def f(index):
       input_args = list(reshaped_args)
       input_kwargs = dict(reshaped_kwargs)
@@ -433,9 +483,6 @@ def microbatch(
     def body_fun(index, carry):
       return accumulator_.update(carry, f(index), index)
 
-    early_stop = num_real_microbatches is not None
-    loop_bound = num_real_microbatches if early_stop else num_microbatches
-    init_carry = accumulator_.init(jax.eval_shape(f, 0))
     answer = jax.lax.fori_loop(0, loop_bound, body_fun, init_carry)
 
     return accumulator_.finalize(answer)
